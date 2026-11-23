@@ -47,18 +47,18 @@ export default function WakeScribeDashboard() {
   const [syncingRate, setSyncingRate] = useState(false);
   const [ecoTips, setEcoTips] = useState<{ id: string; category: string; tip_text: string }[]>([]);
 
-  const [brokerageName, setBrokerageName] = useState('Aegean Yachting Partners');
+  const [brokerageName, setBrokerageName] = useState('');
   const [charterCode, setCharterCode] = useState('CHR-2027-01');
-  const [clientName, setClientName] = useState('A. Papadopoulos');
+  const [clientName, setClientName] = useState('');
 
   const [selectedVesselId, setSelectedVesselId] = useState<string>('new');
-  const [vesselName, setVesselName] = useState('M/Y Apekoula');
+  const [vesselName, setVesselName] = useState('');
   const [lengthMeters, setLengthMeters] = useState<number>(34);
   const [grossTonnage, setGrossTonnage] = useState<number>(240);
   const [fuelType, setFuelType] = useState<'MGO' | 'HVO_Biofuel'>('MGO');
 
-  const [departurePort, setDeparturePort] = useState('Athens (Flisvos)');
-  const [arrivalPort, setArrivalPort] = useState('Mykonos');
+  const [departurePort, setDeparturePort] = useState('');
+  const [arrivalPort, setArrivalPort] = useState('');
   const [charterDays, setCharterDays] = useState<number>(7);
   const [distanceNm, setDistanceNm] = useState<number>(95);
   const [cruisingSpeed, setCruisingSpeed] = useState<number>(14);
@@ -108,9 +108,12 @@ export default function WakeScribeDashboard() {
       .from('broker_profiles')
       .select('brokerage_name')
       .eq('user_id', user.id)
-      .single();
+      .maybeSingle();
+    const metaName = (user.user_metadata?.brokerage_name as string) || '';
     if (profile?.brokerage_name) {
       setBrokerageName(profile.brokerage_name);
+    } else if (metaName) {
+      setBrokerageName(metaName);
     }
 
     const { data: rates } = await supabase.from('market_rates').select('*');
@@ -443,13 +446,32 @@ export default function WakeScribeDashboard() {
           </div>
 
           <div>
-            <label className="block text-xs text-slate-400 mb-1">Brokerage / Agency Name (Saved to Profile)</label>
-            <input
-              type="text"
-              value={brokerageName}
-              onChange={(e) => setBrokerageName(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-cyan-300 font-medium"
-            />
+            <label className="block text-xs text-slate-400 mb-1">Brokerage / Agency Name (Permanent Profile)</label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                placeholder="e.g. Aegean Yachting Partners"
+                value={brokerageName}
+                onChange={(e) => setBrokerageName(e.target.value)}
+                className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-cyan-300 font-medium"
+              />
+              <button
+                type="button"
+                onClick={async () => {
+                  await supabase.auth.updateUser({ data: { brokerage_name: brokerageName } });
+                  await supabase.from('broker_profiles').upsert({
+                    user_id: user.id,
+                    brokerage_name: brokerageName,
+                    contact_email: user.email,
+                  });
+                  setSaveMessage('Agency Name saved permanently to your profile!');
+                  setTimeout(() => setSaveMessage(null), 3000);
+                }}
+                className="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-white px-3 py-2 rounded-lg font-medium transition"
+              >
+                Save Name
+              </button>
+            </div>
           </div>
 
           <FleetSelector
@@ -829,3 +851,5 @@ export default function WakeScribeDashboard() {
     </div>
   );
 }
+
+

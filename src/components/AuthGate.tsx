@@ -19,7 +19,7 @@ export default function AuthGate() {
 
     try {
       if (isSignUp) {
-        const { data, error } = await supabase.auth.signUp({ email, password });
+        const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { brokerage_name: brokerageName.trim() } } });
         if (error) throw error;
         if (data.user) {
           await supabase.from('broker_profiles').upsert({
@@ -136,3 +136,4 @@ export default function AuthGate() {
     </div>
   );
 }
+
