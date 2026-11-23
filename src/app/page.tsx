@@ -851,5 +851,3 @@ export default function WakeScribeDashboard() {
     </div>
   );
 }
-
-

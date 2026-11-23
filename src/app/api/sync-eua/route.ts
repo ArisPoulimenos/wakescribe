@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 export async function POST() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const finnhubKey = process.env.FINNHUB_API_KEY;
 
   if (!supabaseUrl || !supabaseKey) {
     return NextResponse.json({ updated: false, error: 'Missing Supabase env vars' }, { status: 500 });
@@ -13,78 +14,108 @@ export async function POST() {
 
   try {
     let liveEuaEur: number | null = null;
-    let source = 'fallback';
+    let source = 'cached_fallback';
+    const debugNotes: string[] = [];
 
-    // 1. Primary: Yahoo Finance EU Carbon Permits / ICE EUA Futures proxy (CO2.L / CFI2Z26.NYM)
-    const tickers = ['CO2.L', 'CFI2Z26.NYM'];
-    for (const ticker of tickers) {
-      try {
-        const res = await fetch(
-          `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`,
-          {
-            headers: { 'User-Agent': 'Mozilla/5.0' },
-            cache: 'no-store',
+    // 1. Primary (Zero API key required): Live EU Carbon Permits (EUR/tCO2) benchmark
+    try {
+      const teRes = await fetch('https://tradingeconomics.com/commodity/carbon', {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          Accept: 'text/html',
+        },
+        cache: 'no-store',
+      });
+      if (teRes.ok) {
+        const html = await teRes.text();
+        // Match the live spot/front-month EUR price displayed on the EU Carbon Permits quote table
+        const match =
+          html.match(/EU Carbon Permits[\s\S]{0,600}?>\s*([5-9]\d\.\d{2}|1[0-4]\d\.\d{2})\s*</i) ||
+          html.match(/id=["']p["'][^>]*>\s*([5-9]\d\.\d{2}|1[0-4]\d\.\d{2})\s*</i);
+        if (match && match[1]) {
+          const parsed = Number(match[1]);
+          if (parsed >= 40 && parsed <= 160) {
+            liveEuaEur = Number(parsed.toFixed(2));
+            source = 'EU_Carbon_Spot_EUR';
           }
-        );
-        if (res.ok) {
-          const json = await res.json();
-          const meta = json?.chart?.result?.[0]?.meta;
-          const price = Number(meta?.regularMarketPrice);
-          const currency = String(meta?.currency || '').toUpperCase();
-
-          if (price > 10 && price < 300) {
-            if (currency === 'EUR') {
-              liveEuaEur = Number(price.toFixed(2));
-              source = ticker;
-              break;
-            } else if (currency === 'USD') {
-              // Convert USD to EUR using live EURUSD=X
-              const fxRes = await fetch(
-                'https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X?interval=1d&range=1d',
-                { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store' }
-              );
-              const fxJson = await fxRes.json();
-              const eurUsd = Number(fxJson?.chart?.result?.[0]?.meta?.regularMarketPrice) || 1.08;
-              liveEuaEur = Number((price / eurUsd).toFixed(2));
-              source = `${ticker} (FX adjusted)`;
-              break;
-            }
-          }
+        } else {
+          debugNotes.push('TE_pattern_not_matched');
         }
-      } catch {
-        // Continue to next source
+      } else {
+        debugNotes.push(`TE_status_${teRes.status}`);
       }
+    } catch (e) {
+      debugNotes.push(`TE_err_${e instanceof Error ? e.message : 'unknown'}`);
     }
 
-    // 2. Fallback: Read current cached price from Supabase so timestamp refreshes cleanly
-    const { data: existing } = await supabase
+    // 2. Secondary (Backup inside Plan A): Finnhub KEUA + Free ECB FX (frankfurter.app)
+    if (!liveEuaEur && finnhubKey) {
+      try {
+        const [quoteRes, fxRes] = await Promise.all([
+          fetch(`https://finnhub.io/api/v1/quote?symbol=KEUA&token=${finnhubKey}`, { cache: 'no-store' }),
+          fetch('https://api.frankfurter.app/latest?from=EUR&to=USD', { cache: 'no-store' }),
+        ]);
+
+        const quote = quoteRes.ok ? await quoteRes.json() : null;
+        const fx = fxRes.ok ? await fxRes.json() : null;
+        const usdPrice = Number(quote?.c || quote?.pc); // current price or previous close
+        const eurUsd = Number(fx?.rates?.USD) || 1.08;
+
+        if (usdPrice > 5) {
+          liveEuaEur = Number(((usdPrice / eurUsd) * 2.55).toFixed(2));
+          source = 'finnhub_KEUA_ECB_FX';
+        } else {
+          debugNotes.push(`Finnhub_quote_${JSON.stringify(quote)}`);
+        }
+      } catch (e) {
+        debugNotes.push(`Finnhub_err_${e instanceof Error ? e.message : 'unknown'}`);
+      }
+    } else if (!finnhubKey) {
+      debugNotes.push('FINNHUB_API_KEY_not_loaded');
+    }
+
+    // 3. Tertiary: Supabase cached rate
+    const { data: existing, error: selErr } = await supabase
       .from('market_rates')
-      .select('price')
+      .select('id, price')
       .eq('indicator_name', 'EU Carbon Permits')
       .maybeSingle();
 
-    const finalPrice = liveEuaEur ?? (existing?.price ? Number(existing.price) : 84.85);
+    if (selErr) {
+      return NextResponse.json({ updated: false, error: selErr.message }, { status: 500 });
+    }
 
-    const { error: upsertErr } = await supabase
-      .from('market_rates')
-      .upsert(
-        {
+    const finalPrice = liveEuaEur ?? (existing?.price ? Number(existing.price) : 84.85);
+    const nowIso = new Date().toISOString();
+
+    if (existing?.id) {
+      const { error: updErr } = await supabase
+        .from('market_rates')
+        .update({ price: finalPrice, updated_at: nowIso })
+        .eq('id', existing.id);
+      if (updErr) {
+        return NextResponse.json({ updated: false, error: updErr.message }, { status: 500 });
+      }
+    } else {
+      const { error: insErr } = await supabase
+        .from('market_rates')
+        .insert({
           indicator_name: 'EU Carbon Permits',
           price: finalPrice,
           unit: 'EUR/tCO2',
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'indicator_name' }
-      );
-
-    if (upsertErr) {
-      return NextResponse.json({ updated: false, error: upsertErr.message }, { status: 500 });
+          updated_at: nowIso,
+        });
+      if (insErr) {
+        return NextResponse.json({ updated: false, error: insErr.message }, { status: 500 });
+      }
     }
 
     return NextResponse.json({
       updated: true,
       price: finalPrice,
       source,
+      debug: debugNotes,
+      updated_at: nowIso,
     });
   } catch (err: unknown) {
     return NextResponse.json(
